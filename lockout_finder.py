@@ -2,7 +2,7 @@
 """
 ADLockoutBuster - Account Lockout Source Finder
 Author: Morris James / Techify
-Version: 1.1.1
+Version: 1.1.2
 """
 
 import sys
@@ -331,12 +331,29 @@ try {{
         except Exception:
             return None
 
+    @staticmethod
+    def _clean_dc_name(raw: str) -> str:
+        """Sanitise a DC hostname — strip leading backslashes, stray quotes,
+        brackets, trailing dots, and whitespace that nltest / AD cmdlets can leave."""
+        name = raw.strip()
+        name = name.lstrip('\\/')          # \\DCNAME → DCNAME
+        name = name.strip("'\"")           # trailing/leading quotes
+        name = name.split()[0] if name else name   # "DCNAME [PDC]" → "DCNAME"
+        name = name.strip("[]'\"")         # remove any leftover brackets/quotes
+        name = name.rstrip('.')            # trailing FQDN dot
+        return name.strip()
+
     def get_domain_controllers(self) -> List[str]:
         dcs = []
         scripts = [
-            "nltest /dclist: 2>$null | ForEach-Object { if ($_ -match '\\\\(\\S+)') { $matches[1] } }",
+            # Best: AD module — returns clean FQDNs, one per line
+            "Get-ADDomainController -Filter * -ErrorAction SilentlyContinue | Select-Object -ExpandProperty HostName",
+            # Good: AD domain replica list
             "(Get-ADDomain -ErrorAction SilentlyContinue).ReplicaDirectoryServers | ForEach-Object { $_ }",
+            # Good: .NET — works without AD module
             "([System.DirectoryServices.ActiveDirectory.Domain]::GetCurrentDomain().DomainControllers | Select-Object -Expand Name) 2>$null",
+            # Fallback: nltest — parse \\DCNAME entries, strip the double backslash properly
+            "nltest /dclist: 2>$null | Where-Object { $_ -match '^\\s*\\\\\\\\' } | ForEach-Object { ($_ -replace '^\\s*\\\\\\\\','').Split()[0] }",
         ]
         for ps in scripts:
             try:
@@ -345,8 +362,8 @@ try {{
                     capture_output=True, text=True, timeout=20
                 )
                 for line in r.stdout.splitlines():
-                    dc = line.strip().rstrip('.')
-                    if dc and dc not in dcs and '.' in dc or (dc and len(dc) > 2):
+                    dc = self._clean_dc_name(line)
+                    if dc and dc not in dcs:
                         dcs.append(dc)
                 if dcs:
                     break
@@ -365,7 +382,7 @@ try {{
                     ["powershell", "-NoProfile", "-NonInteractive", "-Command", ps],
                     capture_output=True, text=True, timeout=15
                 )
-                pdc = r.stdout.strip().rstrip('.')
+                pdc = self._clean_dc_name(r.stdout)
                 if pdc:
                     return pdc
             except Exception:
@@ -2414,7 +2431,7 @@ class MainWindow(QMainWindow):
         nw.addStretch()
         sb_lay.addWidget(nav_wrap)
 
-        ver = QLabel("v1.1.0"); ver.setStyleSheet("color:#484f58;font-size:11px;padding:8px 16px;background:transparent;")
+        ver = QLabel("v1.1.2"); ver.setStyleSheet("color:#484f58;font-size:11px;padding:8px 16px;background:transparent;")
         sb_lay.addWidget(ver)
         root.addWidget(sidebar)
 
