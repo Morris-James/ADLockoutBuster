@@ -530,7 +530,7 @@ $result | ConvertTo-Json -Depth 2 -Compress
 
         lockouts = [e for e in user_events if e.event_id == 4740]
         lines.append(f"Lockout events (4740): {len(lockouts)}")
-        lines.append(f"Failed logon events (4625): {len(e for e in user_events if e.event_id == 4625)}")
+        lines.append(f"Failed logon events (4625): {len([e for e in user_events if e.event_id == 4625])}")
         lines.append("")
 
         # Source machines
