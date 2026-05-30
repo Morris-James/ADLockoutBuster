@@ -2,7 +2,7 @@
 """
 ADLockoutBuster - Account Lockout Source Finder
 Author: Morris James / Techify
-Version: 1.0.0
+Version: 1.1.0
 """
 
 import sys
@@ -26,14 +26,14 @@ try:
         QStackedWidget, QTextEdit, QProgressBar, QStatusBar, QSplitter,
         QTabWidget, QCheckBox, QSpinBox, QFormLayout, QFileDialog,
         QMessageBox, QMenu, QListWidget, QListWidgetItem, QScrollArea,
-        QGroupBox, QDialog, QDialogButtonBox
+        QGroupBox, QDialog, QDialogButtonBox, QSystemTrayIcon
     )
     from PyQt6.QtCore import (
-        Qt, QThread, pyqtSignal, QTimer, QSize, QPoint
+        Qt, QThread, pyqtSignal, QTimer, QSize, QPoint, QRectF
     )
     from PyQt6.QtGui import (
         QColor, QFont, QIcon, QPixmap, QPainter, QBrush, QPalette,
-        QAction, QFontDatabase
+        QAction, QFontDatabase, QPen
     )
 except ImportError:
     print("PyQt6 not installed. Run: pip install PyQt6")
@@ -720,6 +720,53 @@ class LockedAccountsWorker(QThread):
         self.complete.emit(accounts)
 
 
+class RemoteScanWorker(QThread):
+    """Scan a remote machine for services/tasks using a given account."""
+    complete = pyqtSignal(list, str)  # (results, machine_name)
+    error    = pyqtSignal(str)
+
+    def __init__(self, machine: str, username: str):
+        super().__init__()
+        self.machine  = machine
+        self.username = username
+
+    def run(self):
+        comp = f"-ComputerName '{self.machine}'" if self.machine.lower() not in ("localhost", "127.0.0.1") else ""
+        ps = f"""
+$ErrorActionPreference = 'SilentlyContinue'
+$svc = Get-WmiObject Win32_Service {comp} |
+    Where-Object {{ $_.StartName -like '*{self.username}*' }} |
+    Select-Object Name, DisplayName, StartName, State, PathName
+$task = Invoke-Command {comp} -ScriptBlock {{
+    Get-ScheduledTask |
+    Where-Object {{ $_.Principal.UserId -like '*{self.username}*' }} |
+    Select-Object TaskName, TaskPath,
+        @{{N='UserId';E={{$_.Principal.UserId}}}},
+        @{{N='State';E={{$_.State.ToString()}}}}
+}} 2>$null
+$result = @()
+if ($svc)  {{ $result += $svc  | Select-Object @{{N='Type';E={{'Service'}}}},      @{{N='Name';E={{$_.DisplayName}}}}, @{{N='Account';E={{$_.StartName}}}}, @{{N='State';E={{$_.State}}}},         @{{N='Detail';E={{$_.PathName}}}} }}
+if ($task) {{ $result += $task | Select-Object @{{N='Type';E={{'ScheduledTask'}}}}, @{{N='Name';E={{$_.TaskName}}}},   @{{N='Account';E={{$_.UserId}}}},    @{{N='State';E={{$_.State.ToString()}}}}, @{{N='Detail';E={{$_.TaskPath}}}} }}
+if ($result) {{ $result | ConvertTo-Json -Depth 2 -Compress }} else {{ '[]' }}
+"""
+        try:
+            r = subprocess.run(
+                ["powershell", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass",
+                 "-Command", ps],
+                capture_output=True, text=True, timeout=45
+            )
+            if r.stdout.strip():
+                raw = json.loads(r.stdout.strip())
+                if isinstance(raw, dict):
+                    raw = [raw]
+                self.complete.emit(raw or [], self.machine)
+            else:
+                self.complete.emit([], self.machine)
+        except Exception as e:
+            self.error.emit(str(e))
+            self.complete.emit([], self.machine)
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # STYLESHEET
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1085,6 +1132,122 @@ class EventDetailDialog(QDialog):
         lay.addWidget(btns)
 
 
+class TimelineChart(QWidget):
+    """
+    Custom QPainter bar chart — events per hour for the last N hours.
+    Red = lockouts (4740), Orange = failed logons (4625), Blue = other.
+    """
+
+    def __init__(self, hours: int = 24):
+        super().__init__()
+        self._hours = hours
+        self._buckets: List[dict] = []
+        self._hover_idx: int = -1
+        self.setMinimumHeight(110)
+        self.setMouseTracking(True)
+
+    def set_events(self, events: List[LockoutEvent], hours: int = 24):
+        self._hours = hours
+        now = datetime.datetime.utcnow()
+        self._buckets = [{'lockout': 0, 'failed': 0, 'other': 0, 'hour': h}
+                         for h in range(hours - 1, -1, -1)]
+        for e in events:
+            age_h = (now - e.timestamp).total_seconds() / 3600
+            idx = int(age_h)
+            if 0 <= idx < hours:
+                bucket = self._buckets[hours - 1 - idx]
+                if e.event_id == 4740:
+                    bucket['lockout'] += 1
+                elif e.event_id == 4625:
+                    bucket['failed'] += 1
+                else:
+                    bucket['other'] += 1
+        self.update()
+
+    def paintEvent(self, _event):
+        if not self._buckets:
+            return
+        p = QPainter(self)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+
+        W, H = self.width(), self.height()
+        pad_l, pad_r, pad_t, pad_b = 6, 6, 8, 22
+        chart_w = W - pad_l - pad_r
+        chart_h = H - pad_t - pad_b
+
+        n = len(self._buckets)
+        bar_slot = chart_w / n
+        bar_w = max(2.0, bar_slot - 2)
+
+        max_val = max(b['lockout'] + b['failed'] + b['other'] for b in self._buckets) or 1
+
+        # Background grid line
+        p.setPen(QPen(QColor("#21262d"), 1))
+        p.drawLine(pad_l, pad_t, pad_l + chart_w, pad_t)
+        p.drawLine(pad_l, pad_t + chart_h // 2, pad_l + chart_w, pad_t + chart_h // 2)
+
+        for i, b in enumerate(self._buckets):
+            total = b['lockout'] + b['failed'] + b['other']
+            x = pad_l + i * bar_slot + (bar_slot - bar_w) / 2
+
+            is_hover = (i == self._hover_idx)
+            if is_hover and total > 0:
+                p.fillRect(QRectF(x - 1, pad_t, bar_w + 2, chart_h), QColor("#1c2128"))
+
+            if total == 0:
+                continue
+
+            y = pad_t + chart_h
+            for key, color_hex in [('lockout', '#ef5350'), ('failed', '#ffa726'), ('other', '#42a5f5')]:
+                count = b[key]
+                if count == 0:
+                    continue
+                seg_h = max(2.0, (count / max_val) * chart_h)
+                y -= seg_h
+                p.fillRect(QRectF(x, y, bar_w, seg_h), QColor(color_hex))
+
+        # X-axis labels — every 4 hours
+        p.setPen(QPen(QColor("#484f58"), 1))
+        p.setFont(QFont("Segoe UI", 8))
+        now_hour = datetime.datetime.now().hour
+        for i, b in enumerate(self._buckets):
+            hours_ago = n - 1 - i
+            if hours_ago % 4 == 0:
+                label_h = (now_hour - hours_ago) % 24
+                label = f"{label_h:02d}:00"
+                p.drawText(int(pad_l + i * bar_slot), H - 2, label)
+
+        # Hover tooltip
+        if self._hover_idx >= 0 and self._hover_idx < n:
+            b = self._buckets[self._hover_idx]
+            total = b['lockout'] + b['failed'] + b['other']
+            if total > 0:
+                hours_ago = n - 1 - self._hover_idx
+                tip = (f"{hours_ago}h ago  |  "
+                       f"🔒 {b['lockout']}  ⚠ {b['failed']}  ● {b['other']}")
+                p.setPen(QPen(QColor("#c9d1d9"), 1))
+                p.setFont(QFont("Segoe UI", 9))
+                p.drawText(pad_l + 2, pad_t + 14, tip)
+
+        p.end()
+
+    def mouseMoveEvent(self, ev):
+        n = len(self._buckets)
+        if n == 0:
+            return
+        pad_l, pad_r = 6, 6
+        bar_slot = (self.width() - pad_l - pad_r) / n
+        idx = int((ev.position().x() - pad_l) / bar_slot)
+        idx = max(0, min(n - 1, idx))
+        if idx != self._hover_idx:
+            self._hover_idx = idx
+            self.update()
+
+    def leaveEvent(self, _ev):
+        self._hover_idx = -1
+        self.update()
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # PAGES
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1140,6 +1303,21 @@ class DashboardPage(QWidget):
         self.spray_banner.setVisible(False)
         lay.addWidget(self.spray_banner)
 
+        # Timeline chart
+        chart_frame = QFrame(); chart_frame.setObjectName("card")
+        cf_lay = QVBoxLayout(chart_frame); cf_lay.setSpacing(4)
+        chart_hdr = QHBoxLayout()
+        chart_ttl = QLabel("Event Timeline  (last 24h, by hour)")
+        chart_ttl.setObjectName("section_ttl"); chart_hdr.addWidget(chart_ttl)
+        chart_hdr.addStretch()
+        legend = QLabel("🔒 Lockout  ⚠ Failed Logon  ● Other")
+        legend.setStyleSheet("color:#484f58;font-size:11px;background:transparent;")
+        chart_hdr.addWidget(legend)
+        cf_lay.addLayout(chart_hdr)
+        self.timeline_chart = TimelineChart()
+        cf_lay.addWidget(self.timeline_chart)
+        lay.addWidget(chart_frame)
+
         # Event table
         tbl_frame = QFrame(); tbl_frame.setObjectName("card")
         tbl_lay = QVBoxLayout(tbl_frame)
@@ -1184,6 +1362,7 @@ class DashboardPage(QWidget):
         self._spray_alerts = spray_alerts
         self.spray_banner.setVisible(len(spray_alerts) > 0)
 
+        self.timeline_chart.set_events(events, hours=24)
         self.table.populate(events)
         ts = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         self.status_lbl.setText(f"Last scan: {ts}  ·  {len(events)} total events  ·  {len(lockouts)} lockouts")
@@ -1202,6 +1381,7 @@ class InvestigatePage(QWidget):
         super().__init__()
         self.engine = LockoutEngine()
         self._events: List[LockoutEvent] = []
+        self._rscan_worker: Optional[RemoteScanWorker] = None
         self._build()
 
     def _build(self):
@@ -1280,18 +1460,39 @@ class InvestigatePage(QWidget):
         self.tabs.addTab(w3, "🏢  AD Account Info")
 
         # Services & Tasks
-        w4 = QWidget(); l4 = QVBoxLayout(w4)
-        l4.addWidget(QLabel("Services and Scheduled Tasks running as this account (checked on local machine):"))
+        w4 = QWidget(); l4 = QVBoxLayout(w4); l4.setSpacing(10)
+
+        # Remote scanner bar
+        remote_bar = QFrame(); remote_bar.setObjectName("card")
+        rb_lay = QHBoxLayout(remote_bar); rb_lay.setContentsMargins(12, 8, 12, 8)
+        rb_lay.addWidget(QLabel("Scan machine:"))
+        self.remote_machine_edit = QLineEdit()
+        self.remote_machine_edit.setPlaceholderText("Enter source machine hostname or IP…")
+        self.remote_machine_edit.setFixedHeight(32)
+        rb_lay.addWidget(self.remote_machine_edit, 1)
+        self.remote_scan_btn = QPushButton("🔍  Scan Remote Machine")
+        self.remote_scan_btn.setObjectName("primary_btn")
+        self.remote_scan_btn.setFixedHeight(32)
+        self.remote_scan_btn.clicked.connect(self._remote_scan)
+        rb_lay.addWidget(self.remote_scan_btn)
+        self.remote_status = QLabel("Enter the source machine name identified above, then click Scan.")
+        self.remote_status.setObjectName("page_sub")
+        l4.addWidget(remote_bar)
+        l4.addWidget(self.remote_status)
+
         self.svc_table = QTableWidget()
-        self.svc_table.setColumnCount(4)
-        self.svc_table.setHorizontalHeaderLabels(["Type", "Name", "Account", "State"])
-        self.svc_table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
+        self.svc_table.setColumnCount(5)
+        self.svc_table.setHorizontalHeaderLabels(["Type", "Name", "Account", "State", "Detail"])
+        h4 = self.svc_table.horizontalHeader()
+        h4.setSectionResizeMode(0, QHeaderView.ResizeMode.ResizeToContents)
+        h4.setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
+        h4.setSectionResizeMode(2, QHeaderView.ResizeMode.Stretch)
+        h4.setSectionResizeMode(3, QHeaderView.ResizeMode.ResizeToContents)
+        h4.setSectionResizeMode(4, QHeaderView.ResizeMode.Stretch)
         self.svc_table.setAlternatingRowColors(True)
         self.svc_table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
-        l4.addWidget(self.svc_table)
-        l4.addWidget(QLabel("⚠  Services on remote machines are not scanned here — "
-                             "check each source machine individually.",
-                            styleSheet="color:#8b949e;font-size:11px;"))
+        self.svc_table.verticalHeader().setVisible(False)
+        l4.addWidget(self.svc_table, 1)
         self.tabs.addTab(w4, "⚙  Services & Tasks")
 
         # Netlogon
@@ -1336,19 +1537,56 @@ class InvestigatePage(QWidget):
 
         try:
             svcs = self.engine.get_services_for_account(username)
-            self.svc_table.setRowCount(0)
-            for s in svcs:
-                r = self.svc_table.rowCount(); self.svc_table.insertRow(r)
-                for c, k in enumerate(['Type', 'Name', 'Account', 'State']):
-                    self.svc_table.setItem(r, c, QTableWidgetItem(str(s.get(k, ''))))
-            if not svcs:
-                self.svc_table.setRowCount(1)
-                item = QTableWidgetItem("No local services or scheduled tasks found for this account.")
-                item.setForeground(QColor("#8b949e"))
-                self.svc_table.setItem(0, 0, item)
-                self.svc_table.setSpan(0, 0, 1, 4)
-        except Exception as e:
+            self._populate_svc_table(svcs, "localhost")
+        except Exception:
             pass
+
+    def _populate_svc_table(self, svcs: list, machine: str):
+        self.svc_table.setRowCount(0)
+        for s in svcs:
+            r = self.svc_table.rowCount(); self.svc_table.insertRow(r)
+            type_item = QTableWidgetItem(str(s.get('Type', '')))
+            if s.get('Type') == 'Service':
+                type_item.setForeground(QColor("#ffa726"))
+            elif s.get('Type') == 'ScheduledTask':
+                type_item.setForeground(QColor("#ab47bc"))
+            self.svc_table.setItem(r, 0, type_item)
+            for c, k in enumerate(['Name', 'Account', 'State', 'Detail'], start=1):
+                self.svc_table.setItem(r, c, QTableWidgetItem(str(s.get(k, ''))))
+        if not svcs:
+            self.svc_table.setRowCount(1)
+            item = QTableWidgetItem(f"No services or scheduled tasks found on {machine} for this account.")
+            item.setForeground(QColor("#8b949e"))
+            self.svc_table.setItem(0, 0, item)
+            self.svc_table.setSpan(0, 0, 1, 5)
+
+    def _remote_scan(self):
+        machine = self.remote_machine_edit.text().strip()
+        user    = self.user_edit.text().strip()
+        if not machine:
+            QMessageBox.warning(self, "Machine Required",
+                                "Enter the source machine hostname or IP to scan.")
+            return
+        if not user:
+            QMessageBox.warning(self, "Username Required",
+                                "Investigate a user first, then scan a remote machine.")
+            return
+        self.remote_scan_btn.setEnabled(False)
+        self.remote_status.setText(f"Scanning {machine} for services/tasks running as '{user}'…")
+        self._rscan_worker = RemoteScanWorker(machine, user)
+        self._rscan_worker.complete.connect(self._on_remote_scan_done)
+        self._rscan_worker.error.connect(
+            lambda msg: self.remote_status.setText(f"Error: {msg}"))
+        self._rscan_worker.start()
+
+    def _on_remote_scan_done(self, results: list, machine: str):
+        self._populate_svc_table(results, machine)
+        n = len(results)
+        self.remote_status.setText(
+            f"Scanned {machine}  ·  {n} service/task match{'es' if n != 1 else ''} found"
+            + ("  ← These are likely causing the lockout!" if n > 0 else "  ← Nothing found here.")
+        )
+        self.remote_scan_btn.setEnabled(True)
 
     def update_events(self, events: List[LockoutEvent], servers: List[str]):
         user = self.user_edit.text().strip()
@@ -1503,6 +1741,8 @@ class ActiveLockoutsPage(QWidget):
 
 
 class MonitorPage(QWidget):
+    lockout_occurred = pyqtSignal(str, str)  # (username, source)
+
     def __init__(self):
         super().__init__()
         self.servers: List[str] = []
@@ -1599,11 +1839,13 @@ class MonitorPage(QWidget):
         self.stream.add_event(ev)
         self.stream.scrollToBottom()
         self.count_lbl.setText(f"{len(self._all_events)} events")
-        if self.alert_cb.isChecked() and ev.event_id == 4740:
-            QMessageBox.warning(self, "Account Locked Out!",
-                                f"Account '{ev.username}' locked out!\n"
-                                f"Source: {ev.caller_machine or ev.caller_ip or 'Unknown'}\n"
-                                f"DC: {ev.source_dc}")
+        if ev.event_id == 4740:
+            source = ev.caller_machine or ev.caller_ip or "Unknown"
+            self.lockout_occurred.emit(ev.username, source)
+            if self.alert_cb.isChecked():
+                QMessageBox.warning(self, "Account Locked Out!",
+                                    f"Account '{ev.username}' locked out!\n"
+                                    f"Source: {source}\nDC: {ev.source_dc}")
 
     def _apply_filter(self):
         lockouts_only = self.lockout_only.isChecked()
@@ -2037,6 +2279,7 @@ class MainWindow(QMainWindow):
 
         self._build_ui()
         self._setup_statusbar()
+        self._setup_tray()
         self._detect_env()
 
     def _build_ui(self):
@@ -2081,7 +2324,7 @@ class MainWindow(QMainWindow):
         nw.addStretch()
         sb_lay.addWidget(nav_wrap)
 
-        ver = QLabel("v1.0.0"); ver.setStyleSheet("color:#484f58;font-size:11px;padding:8px 16px;background:transparent;")
+        ver = QLabel("v1.1.0"); ver.setStyleSheet("color:#484f58;font-size:11px;padding:8px 16px;background:transparent;")
         sb_lay.addWidget(ver)
         root.addWidget(sidebar)
 
@@ -2119,6 +2362,53 @@ class MainWindow(QMainWindow):
         self._progress = QProgressBar(); self._progress.setFixedSize(180, 5)
         self._progress.setVisible(False)
         sb.addPermanentWidget(self._progress)
+
+    def _setup_tray(self):
+        if not QSystemTrayIcon.isSystemTrayAvailable():
+            self._tray = None
+            return
+
+        # Build a simple lock-icon pixmap
+        px = QPixmap(32, 32)
+        px.fill(QColor(0, 0, 0, 0))
+        painter = QPainter(px)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        painter.setBrush(QBrush(QColor("#1f6feb")))
+        painter.setPen(QPen(QColor("#58a6ff"), 2))
+        painter.drawRoundedRect(4, 14, 24, 16, 4, 4)
+        painter.setBrush(QBrush(QColor(0, 0, 0, 0)))
+        painter.setPen(QPen(QColor("#58a6ff"), 3))
+        painter.drawArc(8, 4, 16, 18, 0, 180 * 16)
+        painter.end()
+
+        self._tray = QSystemTrayIcon(QIcon(px), self)
+        self._tray.setToolTip("ADLockoutBuster — Monitoring")
+
+        tray_menu = QMenu()
+        show_act = QAction("Show Window", self)
+        show_act.triggered.connect(self._tray_show)
+        quit_act = QAction("Quit", self)
+        quit_act.triggered.connect(QApplication.quit)
+        tray_menu.addAction(show_act)
+        tray_menu.addSeparator()
+        tray_menu.addAction(quit_act)
+        self._tray.setContextMenu(tray_menu)
+        self._tray.activated.connect(self._tray_activated)
+        self._tray.show()
+
+    def _tray_show(self):
+        self.showNormal()
+        self.raise_()
+        self.activateWindow()
+
+    def _tray_activated(self, reason):
+        if reason == QSystemTrayIcon.ActivationReason.DoubleClick:
+            self._tray_show()
+
+    def tray_notify(self, title: str, message: str):
+        if self._tray:
+            self._tray.showMessage(title, message,
+                                   QSystemTrayIcon.MessageIcon.Warning, 5000)
 
     def _detect_env(self):
         domain = os.environ.get('USERDNSDOMAIN', '') or os.environ.get('USERDOMAIN', '')
@@ -2179,9 +2469,24 @@ class MainWindow(QMainWindow):
     def _on_servers_changed(self, servers: List[str]):
         self._servers = servers
         self.monitor_pg.set_servers(servers)
+        self.monitor_pg.lockout_occurred.connect(self._on_tray_lockout)
         self._status_lbl.setText(f"{len(servers)} DC(s) configured  ·  Ready to scan")
 
+    def _on_tray_lockout(self, username: str, source: str):
+        self.tray_notify(
+            "Account Locked Out!",
+            f"{username} locked out\nSource: {source}"
+        )
+
     def closeEvent(self, event):
+        if self._tray and self._tray.isVisible() and self.monitor_pg._monitor and self.monitor_pg._monitor.isRunning():
+            self.hide()
+            self._tray.showMessage(
+                "ADLockoutBuster", "Still monitoring in the background. Double-click the tray icon to restore.",
+                QSystemTrayIcon.MessageIcon.Information, 3000
+            )
+            event.ignore()
+            return
         if self._scan_worker and self._scan_worker.isRunning():
             self._scan_worker.stop()
         if self.monitor_pg._monitor and self.monitor_pg._monitor.isRunning():
