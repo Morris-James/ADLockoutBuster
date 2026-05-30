@@ -2,7 +2,7 @@
 """
 ADLockoutBuster - Account Lockout Source Finder
 Author: Morris James / Techify
-Version: 1.1.0
+Version: 1.1.1
 """
 
 import sys
@@ -1874,6 +1874,20 @@ class MonitorPage(QWidget):
         d.exec()
 
 
+class _PingAllWorker(QThread):
+    """Check connectivity to a list of DCs using TCP (not ICMP)."""
+    result = pyqtSignal(int, bool, str, str)   # (row_idx, ok, label, ip)
+
+    def __init__(self, dcs: List[str]):
+        super().__init__()
+        self.dcs = dcs
+
+    def run(self):
+        for i, dc in enumerate(self.dcs):
+            ok, label, ip = DCManagerPage._tcp_check(dc)
+            self.result.emit(i, ok, label, ip)
+
+
 class DCManagerPage(QWidget):
     servers_changed = pyqtSignal(list)
 
@@ -1925,7 +1939,7 @@ class DCManagerPage(QWidget):
         thdr = QHBoxLayout()
         self.dc_count_lbl = QLabel("0 DCs configured"); thdr.addWidget(self.dc_count_lbl)
         thdr.addStretch()
-        ping_btn = QPushButton("🏓  Ping All"); ping_btn.setObjectName("secondary_btn")
+        ping_btn = QPushButton("🔌  Test Connectivity"); ping_btn.setObjectName("secondary_btn")
         ping_btn.clicked.connect(self._ping_all); thdr.addWidget(ping_btn)
         tl.addLayout(thdr)
 
@@ -1989,22 +2003,59 @@ class DCManagerPage(QWidget):
             self.dc_table.setItem(r, 3, QTableWidgetItem("—"))
         self.dc_count_lbl.setText(f"{len(self.dcs)} DC(s) configured")
 
-    def _ping_all(self):
-        for i, dc in enumerate(self.dcs):
+    # DC ports that are always open — far more reliable than ICMP which
+    # Windows Firewall blocks by default on DCs and most servers.
+    _DC_PORTS = [
+        (389,  "LDAP"),
+        (88,   "Kerberos"),
+        (445,  "SMB"),
+        (3268, "Global Catalog"),
+        (636,  "LDAPS"),
+    ]
+
+    @staticmethod
+    def _tcp_check(host: str, timeout: float = 2.0) -> tuple[bool, str, str]:
+        """
+        Try TCP connect to known DC ports. Returns (reachable, port_label, ip).
+        Never uses ICMP — works even when Windows Firewall blocks ping.
+        """
+        ip = ""
+        try:
+            ip = socket.gethostbyname(host)
+        except socket.gaierror:
+            return False, "DNS failure", ""
+
+        for port, label in DCManagerPage._DC_PORTS:
             try:
-                r = subprocess.run(["ping", "-n", "1", "-w", "1500", dc],
-                                   capture_output=True, timeout=5)
-                ok = r.returncode == 0
-                item = QTableWidgetItem("Online" if ok else "Offline")
-                item.setForeground(QColor("#2da44e" if ok else "#ef5350"))
-                self.dc_table.setItem(i, 3, item)
-                try:
-                    ip = socket.gethostbyname(dc)
-                    self.dc_table.setItem(i, 2, QTableWidgetItem(ip))
-                except Exception:
-                    pass
-            except Exception:
-                self.dc_table.setItem(i, 3, QTableWidgetItem("Error"))
+                with socket.create_connection((ip, port), timeout=timeout):
+                    return True, label, ip
+            except (socket.timeout, ConnectionRefusedError, OSError):
+                continue
+        return False, "All ports closed/filtered", ip
+
+    def _ping_all(self):
+        ping_btn = self.sender()
+        if ping_btn:
+            ping_btn.setEnabled(False)
+        self.disc_lbl.setText("Checking connectivity (TCP — not ICMP)…")
+
+        worker = _PingAllWorker(self.dcs)
+        worker.result.connect(self._on_ping_result)
+        worker.finished.connect(lambda: (
+            self.disc_lbl.setText("Connectivity check complete."),
+            ping_btn.setEnabled(True) if ping_btn else None,
+        ))
+        worker.setParent(self)
+        worker.start()
+        self._ping_worker = worker          # keep alive
+
+    def _on_ping_result(self, idx: int, ok: bool, label: str, ip: str):
+        status_text = f"Online  ({label})" if ok else f"Offline  ({label})"
+        item = QTableWidgetItem(status_text)
+        item.setForeground(QColor("#2da44e" if ok else "#ef5350"))
+        self.dc_table.setItem(idx, 3, item)
+        if ip:
+            self.dc_table.setItem(idx, 2, QTableWidgetItem(ip))
 
     def _ctx(self, pos):
         row = self.dc_table.currentRow()
@@ -2013,7 +2064,8 @@ class DCManagerPage(QWidget):
         dc = self.dc_table.item(row, 0).text() if self.dc_table.item(row, 0) else ""
         menu = QMenu(self)
         menu.addAction(f"Remove {dc}").triggered.connect(lambda: self._remove(dc))
-        menu.addAction(f"Ping {dc}").triggered.connect(lambda: self._single_ping(dc))
+        menu.addAction(f"Test connectivity: {dc}").triggered.connect(
+            lambda: self._single_ping(dc))
         menu.exec(self.dc_table.mapToGlobal(pos))
 
     def _remove(self, dc: str):
@@ -2023,11 +2075,40 @@ class DCManagerPage(QWidget):
             self.servers_changed.emit(self.dcs)
 
     def _single_ping(self, dc: str):
+        lines = [f"Connectivity Report: {dc}", "=" * 45, ""]
+        ok_any = False
         try:
-            r = subprocess.run(["ping", "-n", "4", dc], capture_output=True, text=True, timeout=15)
-            QMessageBox.information(self, f"Ping {dc}", r.stdout or r.stderr)
-        except Exception as e:
-            QMessageBox.warning(self, "Error", str(e))
+            ip = socket.gethostbyname(dc)
+            lines.append(f"  DNS Resolution:  {ip}")
+        except socket.gaierror as e:
+            lines.append(f"  DNS Resolution:  FAILED — {e}")
+            lines.append("")
+            lines.append("Cannot proceed: hostname does not resolve.")
+            QMessageBox.warning(self, f"Connectivity: {dc}", "\n".join(lines))
+            return
+
+        lines.append("")
+        lines.append("  TCP Port Checks:")
+        for port, label in self._DC_PORTS:
+            try:
+                with socket.create_connection((ip, port), timeout=2):
+                    lines.append(f"    {port:5d}  {label:<18}  OPEN")
+                    ok_any = True
+            except Exception:
+                lines.append(f"    {port:5d}  {label:<18}  closed / filtered")
+
+        lines.append("")
+        if ok_any:
+            lines.append("Result: REACHABLE — at least one DC port is open.")
+            lines.append("ADLockoutBuster can scan this DC.")
+        else:
+            lines.append("Result: UNREACHABLE — no DC ports responded.")
+            lines.append("Check network access and Windows Firewall rules.")
+            lines.append("")
+            lines.append("Note: ICMP (ping) is intentionally NOT used here.")
+            lines.append("Windows Firewall blocks ping on DCs by default.")
+
+        QMessageBox.information(self, f"Connectivity: {dc}", "\n".join(lines))
 
     def get_servers(self) -> List[str]:
         return self.dcs.copy()
