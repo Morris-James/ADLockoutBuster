@@ -18,6 +18,15 @@ from pathlib import Path
 from typing import Optional, List, Dict
 from dataclasses import dataclass, field
 
+
+def _app_icon_path() -> str:
+    """Return the path to ADLockoutBuster.ico whether running from source or as a PyInstaller exe."""
+    if getattr(sys, 'frozen', False):
+        base = Path(sys._MEIPASS)
+    else:
+        base = Path(__file__).parent
+    return str(base / "ADLockoutBuster.ico")
+
 try:
     from PyQt6.QtWidgets import (
         QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
@@ -2368,20 +2377,8 @@ class MainWindow(QMainWindow):
             self._tray = None
             return
 
-        # Build a simple lock-icon pixmap
-        px = QPixmap(32, 32)
-        px.fill(QColor(0, 0, 0, 0))
-        painter = QPainter(px)
-        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
-        painter.setBrush(QBrush(QColor("#1f6feb")))
-        painter.setPen(QPen(QColor("#58a6ff"), 2))
-        painter.drawRoundedRect(4, 14, 24, 16, 4, 4)
-        painter.setBrush(QBrush(QColor(0, 0, 0, 0)))
-        painter.setPen(QPen(QColor("#58a6ff"), 3))
-        painter.drawArc(8, 4, 16, 18, 0, 180 * 16)
-        painter.end()
-
-        self._tray = QSystemTrayIcon(QIcon(px), self)
+        app_icon = QIcon(_app_icon_path())
+        self._tray = QSystemTrayIcon(app_icon, self)
         self._tray.setToolTip("ADLockoutBuster — Monitoring")
 
         tray_menu = QMenu()
@@ -2505,7 +2502,11 @@ def main():
     app.setStyle("Fusion")
     app.setStyleSheet(APP_STYLE)
 
+    icon = QIcon(_app_icon_path())
+    app.setWindowIcon(icon)
+
     win = MainWindow()
+    win.setWindowIcon(icon)
     win.show()
 
     sys.exit(app.exec())

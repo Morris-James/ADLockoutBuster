@@ -25,7 +25,8 @@ pyinstaller ^
     --onefile ^
     --windowed ^
     --name "ADLockoutBuster" ^
-    --add-data "." ^
+    --icon "ADLockoutBuster.ico" ^
+    --add-data "ADLockoutBuster.ico;." ^
     --hidden-import PyQt6 ^
     --hidden-import PyQt6.QtWidgets ^
     --hidden-import PyQt6.QtCore ^
