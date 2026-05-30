@@ -2,7 +2,7 @@
 """
 ADLockoutBuster - Account Lockout Source Finder
 Author: Morris James / Techify
-Version: 1.1.2
+Version: 1.1.3
 """
 
 import sys
@@ -430,26 +430,71 @@ try {
             return False, str(e)
 
     def get_ad_account_info(self, username: str) -> dict:
-        ps = f"""
-Get-ADUser '{username}' -Properties LockedOut, BadLogonCount, LastBadPasswordAttempt,
-    PasswordExpired, PasswordLastSet, AccountExpires, LastLogonDate,
-    AccountExpirationDate, Enabled, PasswordNeverExpires, DistinguishedName,
-    Department, Title, Manager, Description -ErrorAction SilentlyContinue |
-Select-Object SamAccountName, Enabled, LockedOut, BadLogonCount,
-    LastBadPasswordAttempt, PasswordExpired, PasswordLastSet,
-    AccountExpires, LastLogonDate, PasswordNeverExpires,
-    Department, Title, Description, DistinguishedName |
+        # Primary: ADSI DirectorySearcher — built into Windows, no RSAT needed
+        ps_adsi = f"""
+$ErrorActionPreference = 'SilentlyContinue'
+try {{
+    $s = New-Object System.DirectoryServices.DirectorySearcher
+    $s.Filter = "(samaccountname={username})"
+    $s.PropertiesToLoad.AddRange(@(
+        'sAMAccountName','displayName','distinguishedName',
+        'lockoutTime','badPwdCount','badPasswordTime',
+        'lastLogon','lastLogonTimestamp','pwdLastSet',
+        'userAccountControl','accountExpires',
+        'department','title','description','mail'
+    ))
+    $r = $s.FindOne()
+    if ($r) {{
+        $p   = $r.Properties
+        $uac = [int]($p['useraccountcontrol'][0])
+        function fts($v) {{
+            if ($v -and [int64]$v -gt 0) {{
+                try {{ [datetime]::FromFileTime([int64]$v).ToString('yyyy-MM-dd HH:mm:ss') }}
+                catch {{ 'N/A' }}
+            }} else {{ 'Never' }}
+        }}
+        [PSCustomObject]@{{
+            SamAccountName       = "$($p['samaccountname'][0])"
+            DisplayName          = "$($p['displayname'][0])"
+            Enabled              = (($uac -band 2) -eq 0)
+            LockedOut            = ([int64]($p['lockouttime'][0]) -gt 0)
+            BadLogonCount        = [int]($p['badpwdcount'][0])
+            LastBadPasswordAttempt = fts($p['badpasswordtime'][0])
+            PasswordLastSet      = fts($p['pwdlastset'][0])
+            LastLogon            = fts($p['lastlogontimestamp'][0])
+            PasswordNeverExpires = (($uac -band 65536) -ne 0)
+            PasswordExpired      = (($uac -band 8388608) -ne 0)
+            MustChangePwd        = ([int64]($p['pwdlastset'][0]) -eq 0)
+            Department           = "$($p['department'][0])"
+            Title                = "$($p['title'][0])"
+            Email                = "$($p['mail'][0])"
+            DistinguishedName    = "$($p['distinguishedname'][0])"
+        }} | ConvertTo-Json -Compress
+    }}
+}} catch {{ Write-Error $_.Exception.Message }}
+"""
+        # Fallback: Get-ADUser (requires RSAT)
+        ps_rsat = f"""
+$ErrorActionPreference = 'SilentlyContinue'
+Get-ADUser '{username}' -Properties LockedOut,BadLogonCount,LastBadPasswordAttempt,
+    PasswordExpired,PasswordLastSet,AccountExpires,LastLogonDate,Enabled,
+    PasswordNeverExpires,DistinguishedName,Department,Title,Description,mail |
+Select-Object SamAccountName,Enabled,LockedOut,BadLogonCount,
+    LastBadPasswordAttempt,PasswordExpired,PasswordLastSet,
+    LastLogonDate,PasswordNeverExpires,Department,Title,Description,DistinguishedName |
 ConvertTo-Json -Depth 2 -Compress
 """
-        try:
-            r = subprocess.run(
-                ["powershell", "-NoProfile", "-NonInteractive", "-Command", ps],
-                capture_output=True, text=True, timeout=20
-            )
-            if r.stdout.strip():
-                return json.loads(r.stdout.strip())
-        except Exception:
-            pass
+        for ps in [ps_adsi, ps_rsat]:
+            try:
+                r = subprocess.run(
+                    ["powershell", "-NoProfile", "-NonInteractive", "-Command", ps],
+                    capture_output=True, text=True, timeout=20
+                )
+                out = r.stdout.strip()
+                if out and out.startswith('{'):
+                    return json.loads(out)
+            except Exception:
+                continue
         return {}
 
     def get_services_for_account(self, username: str) -> List[dict]:
@@ -1530,15 +1575,35 @@ class InvestigatePage(QWidget):
 
         lay.addWidget(self.tabs, 1)
 
+    def set_servers(self, servers: List[str]):
+        self._servers = servers
+
     def _start(self):
         user = self.user_edit.text().strip()
         if not user:
             QMessageBox.warning(self, "Username Required", "Please enter a username.")
             return
+
+        servers = getattr(self, '_servers', [])
+        if not servers:
+            reply = QMessageBox.warning(
+                self, "No Domain Controllers Configured",
+                "No domain controllers have been configured.\n\n"
+                "The scan will only check this local machine, which will likely find no events "
+                "unless you are running on a DC.\n\n"
+                "Go to DC Manager → Auto-Discover DCs first for accurate results.\n\n"
+                "Continue with local scan anyway?",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.No
+            )
+            if reply == QMessageBox.StandardButton.No:
+                return
+
         hours_map = {0: 1, 1: 6, 2: 24, 3: 48, 4: 168}
         hours = hours_map[self.time_combo.currentIndex()]
         self.inv_btn.setEnabled(False)
-        self.prog_lbl.setText(f"Scanning for {user}...")
+        dc_info = f"{len(servers)} DC(s)" if servers else "localhost only"
+        self.prog_lbl.setText(f"Scanning {dc_info} for '{user}'…")
         self.scan_requested.emit(user, hours, [])
         QTimer.singleShot(200, lambda: self._local_checks(user))
 
@@ -1546,20 +1611,55 @@ class InvestigatePage(QWidget):
         try:
             ad = self.engine.get_ad_account_info(username)
             if ad:
-                lines = ["AD Account Information\n" + "="*50]
+                # Pretty-print with friendlier labels
+                label_map = {
+                    'SamAccountName': 'Username',
+                    'DisplayName': 'Display Name',
+                    'Enabled': 'Account Enabled',
+                    'LockedOut': 'Currently Locked',
+                    'BadLogonCount': 'Bad Password Count',
+                    'LastBadPasswordAttempt': 'Last Bad Password',
+                    'PasswordLastSet': 'Password Last Set',
+                    'LastLogon': 'Last Logon',
+                    'PasswordNeverExpires': 'Password Never Expires',
+                    'PasswordExpired': 'Password Expired',
+                    'MustChangePwd': 'Must Change Password',
+                    'Department': 'Department',
+                    'Title': 'Job Title',
+                    'Email': 'Email',
+                    'DistinguishedName': 'Distinguished Name',
+                }
+                lines = [f"AD Account — {username}", "=" * 50, ""]
                 for k, v in ad.items():
-                    if v is not None and str(v).strip():
-                        lines.append(f"  {k:<35} {v}")
+                    if v is None or str(v).strip() in ('', 'None', 'null'):
+                        continue
+                    label = label_map.get(k, k)
+                    # Highlight concerning values
+                    flag = ""
+                    if k == 'LockedOut' and str(v).lower() == 'true':
+                        flag = "  ⚠ LOCKED"
+                    elif k == 'BadLogonCount' and int(str(v).split('.')[0] or 0) > 0:
+                        flag = f"  ⚠ {v} bad attempt(s)"
+                        v = ""
+                    elif k == 'PasswordExpired' and str(v).lower() == 'true':
+                        flag = "  ⚠ EXPIRED — user must change password"
+                    elif k == 'Enabled' and str(v).lower() == 'false':
+                        flag = "  ⚠ DISABLED"
+                    lines.append(f"  {label:<30} {v}{flag}")
                 self.ad_txt.setPlainText("\n".join(lines))
             else:
                 self.ad_txt.setPlainText(
-                    "Could not retrieve AD information.\n"
-                    "Ensure you have AD read access and the ActiveDirectory PowerShell module is installed.\n"
-                    "On the DC, run: Import-Module ActiveDirectory\n"
-                    "On a workstation: Install-WindowsFeature RSAT-AD-PowerShell"
+                    f"No AD record found for '{username}'.\n\n"
+                    "Possible reasons:\n"
+                    "  · Username is incorrect (check spelling, no domain prefix)\n"
+                    "  · Account is in a different domain\n"
+                    "  · This machine cannot reach a domain controller\n"
+                    "  · ADSI/LDAP access is blocked by firewall\n\n"
+                    "If you are not domain-joined, install RSAT and connect to the domain first:\n"
+                    "  Add-WindowsCapability -Online -Name Rsat.ActiveDirectory.DS-LDS.Tools~~~~0.0.1.0"
                 )
         except Exception as e:
-            self.ad_txt.setPlainText(f"Error: {e}")
+            self.ad_txt.setPlainText(f"Error retrieving AD info: {e}")
 
         try:
             svcs = self.engine.get_services_for_account(username)
@@ -2431,7 +2531,7 @@ class MainWindow(QMainWindow):
         nw.addStretch()
         sb_lay.addWidget(nav_wrap)
 
-        ver = QLabel("v1.1.2"); ver.setStyleSheet("color:#484f58;font-size:11px;padding:8px 16px;background:transparent;")
+        ver = QLabel("v1.1.3"); ver.setStyleSheet("color:#484f58;font-size:11px;padding:8px 16px;background:transparent;")
         sb_lay.addWidget(ver)
         root.addWidget(sidebar)
 
@@ -2564,6 +2664,7 @@ class MainWindow(QMainWindow):
     def _on_servers_changed(self, servers: List[str]):
         self._servers = servers
         self.monitor_pg.set_servers(servers)
+        self.investigate_pg.set_servers(servers)
         self.monitor_pg.lockout_occurred.connect(self._on_tray_lockout)
         self._status_lbl.setText(f"{len(servers)} DC(s) configured  ·  Ready to scan")
 
